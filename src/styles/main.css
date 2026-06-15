@@ -685,6 +685,89 @@ details > *:not(summary) { margin-top: 0.75rem; }
 
 .site-footer a { color: var(--stone); text-decoration: underline; }
 
+/* ── Slot badges ────────────────────────────────────────────────────────*/
+
+.slot-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--cream);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.slot-badge--a  { background: var(--amber); }
+.slot-badge--sm { width: 18px; height: 18px; font-size: 0.625rem; }
+
+/* ── IR slots grid ──────────────────────────────────────────────────────*/
+
+.ir-slots-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.ir-slot-panel { min-width: 0; }
+
+/* ── Slot label input ───────────────────────────────────────────────────*/
+
+.slot-label-input {
+  font-family: var(--font-display);
+  font-size: 1rem;
+  font-weight: normal;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: none;
+  color: var(--ink);
+  padding: 0 0.25rem;
+  flex: 1;
+  min-width: 0;
+  transition: border-color 0.15s;
+}
+
+.slot-label-input:hover  { border-bottom-color: var(--rule); }
+.slot-label-input:focus  { border-bottom-color: var(--amber); outline: none; }
+
+/* ── Comparison slot buttons ────────────────────────────────────────────*/
+
+.comparison-slot-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.875rem 0.45rem 0.5rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: white;
+  cursor: pointer;
+  transition: all 0.12s;
+  font-size: 0.8125rem;
+  color: var(--stone);
+}
+
+.comparison-slot-btn:hover { border-color: var(--amber); color: var(--ink); }
+
+.comparison-slot-btn.active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--cream);
+}
+
+.comparison-slot-btn.active .slot-badge { background: var(--amber); }
+
+.comparison-slot-btn__label {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ── Responsive ─────────────────────────────────────────────────────────*/
 
 @media (max-width: 640px) {

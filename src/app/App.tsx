@@ -18,26 +18,45 @@ import { loadSourceAsset, loadIRAsset, formatDbFS } from '../audio/assetLoader.j
 import { renderConvolution } from '../audio/renderPipeline.js';
 import { availableRoutingModes } from '../audio/routing/routingEngine.js';
 
-
 import { UploadZone } from '../components/UploadZone.js';
 import { AssetMeta } from '../components/AssetMeta.js';
 import { WaveformCanvas } from '../components/WaveformCanvas.js';
 import { WarningList } from '../components/WarningList.js';
-import { AudioPreview } from '../components/AudioPreview.js';
+import { MultiIRPreview } from '../components/MultiIRPreview.js';
 import { ReportDisplay } from '../components/ReportDisplay.js';
 
 type AppMode = 'basic' | 'advanced';
 
+// The four comparison slots. A is always dry.
+export type SlotId = 'B' | 'C' | 'D';
+const IR_SLOTS: SlotId[] = ['B', 'C', 'D'];
+
+const DEFAULT_LABELS: Record<SlotId, string> = {
+  B: 'Option B',
+  C: 'Option C',
+  D: 'Option D',
+};
+
+export interface IRSlot {
+  id: SlotId;
+  label: string;
+  ir: ImpulseResponseAsset | null;
+  result: RenderResult | null;
+  rendering: boolean;
+  error: string | null;
+  progress: { stage: string; fraction: number } | null;
+}
+
 const ROUTING_LABELS: Record<RoutingMode, { name: string; desc: string }> = {
-  'mono-mono':              { name: 'Mono → Mono',          desc: 'Single channel in, single channel out.' },
-  'mono-stereo':            { name: 'Mono → Stereo',         desc: 'Mono source convolved independently with L and R IR channels.' },
-  'mono-binaural':          { name: 'Mono → Binaural',       desc: 'Mono source convolved with left-ear and right-ear IRs. Headphones required.' },
-  'mono-ambisonic':         { name: 'Mono → Ambisonic',      desc: 'Mono source convolved with each Ambisonic IR channel.' },
-  'stereo-direct':          { name: 'Stereo Direct',         desc: 'L→L, R→R. Simple pairing; assumes symmetric IR capture.' },
-  'stereo-monosum-stereo':  { name: 'Stereo → Mono-sum → Stereo',  desc: 'Source summed to mono, then convolved with stereo IR. Physically interpretable.' },
-  'stereo-monosum-binaural':{ name: 'Stereo → Mono-sum → Binaural', desc: 'Source summed to mono, convolved with binaural IR. Recommended for binaural.' },
-  'stereo-monosum-ambisonic': { name: 'Stereo → Mono-sum → Ambisonic', desc: 'Source summed to mono, convolved with each Ambisonic channel.' },
-  'stereo-true':            { name: 'True Stereo (4-path)',  desc: 'Requires 4 IR channels: LL, LR, RL, RR. Applies all four transfer paths.' },
+  'mono-mono':               { name: 'Mono → Mono',                    desc: 'Single channel in, single channel out.' },
+  'mono-stereo':             { name: 'Mono → Stereo',                   desc: 'Mono source convolved independently with L and R IR channels.' },
+  'mono-binaural':           { name: 'Mono → Binaural',                 desc: 'Mono source convolved with left-ear and right-ear IRs. Headphones required.' },
+  'mono-ambisonic':          { name: 'Mono → Ambisonic',                desc: 'Mono source convolved with each Ambisonic IR channel.' },
+  'stereo-direct':           { name: 'Stereo Direct',                   desc: 'L→L, R→R. Simple pairing; assumes symmetric IR capture.' },
+  'stereo-monosum-stereo':   { name: 'Stereo → Mono-sum → Stereo',      desc: 'Source summed to mono, then convolved with stereo IR. Physically interpretable.' },
+  'stereo-monosum-binaural': { name: 'Stereo → Mono-sum → Binaural',    desc: 'Source summed to mono, convolved with binaural IR. Recommended for binaural.' },
+  'stereo-monosum-ambisonic':{ name: 'Stereo → Mono-sum → Ambisonic',   desc: 'Source summed to mono, convolved with each Ambisonic channel.' },
+  'stereo-true':             { name: 'True Stereo (4-path)',             desc: 'Requires 4 IR channels: LL, LR, RL, RR. Applies all four transfer paths.' },
 };
 
 const LAYOUT_OPTIONS: { value: ChannelLayoutKind; label: string }[] = [
@@ -51,9 +70,9 @@ const LAYOUT_OPTIONS: { value: ChannelLayoutKind; label: string }[] = [
 
 function defaultPreprocessing(): PreprocessingConfiguration {
   return {
-    onsetMode: 'preserve',
+    onsetMode: 'auto',
     onsetFrame: null,
-    preDelayFrames: 0,
+    preDelayFrames: 240, // 5 ms at 48 kHz
     trimEndFrame: null,
     fadeInFrames: 0,
     fadeOutFrames: 0,
@@ -73,184 +92,177 @@ function defaultGain(): GainConfiguration {
   };
 }
 
+function makeSlot(id: SlotId): IRSlot {
+  return { id, label: DEFAULT_LABELS[id], ir: null, result: null, rendering: false, error: null, progress: null };
+}
+
 export function App() {
-  const [mode, setMode]           = useState<AppMode>('basic');
+  const [mode, setMode] = useState<AppMode>('basic');
 
-  // Assets
-  const [sourceAsset, setSourceAsset]   = useState<SourceAsset | null>(null);
-  const [irAsset, setIrAsset]           = useState<ImpulseResponseAsset | null>(null);
-  const [loadError, setLoadError]       = useState<string | null>(null);
+  // Source
+  const [sourceAsset, setSourceAsset] = useState<SourceAsset | null>(null);
+  const [loadError, setLoadError]     = useState<string | null>(null);
 
-  // Configuration
-  const [routing, setRouting]     = useState<RoutingConfiguration>({
-    mode: 'mono-stereo',
-    monoSumLaw: 'linear',
+  // IR slots B / C / D
+  const [slots, setSlots] = useState<Record<SlotId, IRSlot>>({
+    B: makeSlot('B'),
+    C: makeSlot('C'),
+    D: makeSlot('D'),
   });
-  const [preprocessing, setPreprocessing] = useState<PreprocessingConfiguration>(defaultPreprocessing());
-  const [gain, setGain]           = useState<GainConfiguration>(defaultGain());
-  const [targetSR, setTargetSR]   = useState<number | null>(null);
-  const [exportBitDepth, setExportBitDepth] = useState<ExportBitDepth>(24);
-  const [dither, setDither]       = useState(true);
 
-  // Render state
-  const [rendering, setRendering]   = useState(false);
-  const [renderProgress, setRenderProgress] = useState<{ stage: string; fraction: number } | null>(null);
-  const [result, setResult]         = useState<RenderResult | null>(null);
-  const [renderError, setRenderError] = useState<string | null>(null);
+  // Shared processing config
+  const [routing, setRouting]           = useState<RoutingConfiguration>({ mode: 'mono-stereo', monoSumLaw: 'linear' });
+  const [preprocessing, setPreprocessing] = useState<PreprocessingConfiguration>(defaultPreprocessing());
+  const [gain, setGain]                 = useState<GainConfiguration>(defaultGain());
+  const [targetSR, setTargetSR]         = useState<number | null>(null);
+  const [exportBitDepth, setExportBitDepth] = useState<ExportBitDepth>(24);
+  const [dither, setDither]             = useState(true);
+
+  // Rendering state
+  const [anyRendering, setAnyRendering] = useState(false);
+
+  // Helper: update a single slot field
+  const updateSlot = useCallback((id: SlotId, patch: Partial<IRSlot>) => {
+    setSlots(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+  }, []);
 
   // Load source
   const handleSourceFile = useCallback(async (file: File) => {
     setLoadError(null);
-    setResult(null);
     try {
       const asset = await loadSourceAsset(file, 'conventional');
       setSourceAsset(asset);
-      // Auto-pick routing if possible
-      if (irAsset) autoPickRouting(asset.channelCount, irAsset.channelCount, irAsset.layout.kind, setRouting);
+      // Auto-pick routing based on first loaded IR slot
+      const firstIR = IR_SLOTS.map(id => slots[id].ir).find(Boolean);
+      if (firstIR) autoPickRouting(asset.channelCount, firstIR.channelCount, firstIR.layout.kind, setRouting);
     } catch (e) {
       setLoadError(`Source: ${(e as Error).message}`);
     }
-  }, [irAsset]);
+  }, [slots]);
 
-  // Load IR
-  const handleIRFile = useCallback(async (file: File) => {
-    setLoadError(null);
-    setResult(null);
+  // Load IR into a slot
+  const handleIRFile = useCallback(async (slotId: SlotId, file: File) => {
+    updateSlot(slotId, { error: null, result: null });
     try {
       const asset = await loadIRAsset(file);
-      setIrAsset(asset);
+      updateSlot(slotId, { ir: asset });
       if (sourceAsset) autoPickRouting(sourceAsset.channelCount, asset.channelCount, asset.layout.kind, setRouting);
     } catch (e) {
-      setLoadError(`IR: ${(e as Error).message}`);
+      updateSlot(slotId, { error: (e as Error).message });
     }
-  }, [sourceAsset]);
+  }, [sourceAsset, updateSlot]);
 
-  // Confirm IR layout
-  const confirmLayout = (kind: ChannelLayoutKind) => {
-    if (!irAsset) return;
-    setIrAsset({ ...irAsset, layout: { ...irAsset.layout, kind, userConfirmed: true } });
-    if (sourceAsset) autoPickRouting(sourceAsset.channelCount, irAsset.channelCount, kind, setRouting);
+  // Confirm IR layout for a slot
+  const confirmLayout = (slotId: SlotId, kind: ChannelLayoutKind) => {
+    const ir = slots[slotId].ir;
+    if (!ir) return;
+    updateSlot(slotId, { ir: { ...ir, layout: { ...ir.layout, kind, userConfirmed: true } } });
+    if (sourceAsset) autoPickRouting(sourceAsset.channelCount, ir.channelCount, kind, setRouting);
   };
 
-  // Build available routing modes
-  const availableModes = sourceAsset && irAsset
-    ? availableRoutingModes(sourceAsset.channelCount, irAsset.channelCount)
-    : [];
+  // Render all loaded slots
+  const handleRenderAll = async () => {
+    if (!sourceAsset) return;
+    const toRender = IR_SLOTS.filter(id => slots[id].ir !== null);
+    if (toRender.length === 0) return;
 
-  // Collect input warnings before render
-  const inputWarnings: ProcessingWarning[] = [];
-  if (irAsset && !irAsset.layout.userConfirmed && irAsset.channelCount >= 2) {
-    inputWarnings.push({
-      code: 'CONFIRM_FORMAT',
-      severity: 'warning',
-      message: 'Confirm the IR channel format before rendering.',
-      detail: `${irAsset.channelCount}-channel files are ambiguous (stereo, binaural, or Ambisonics). Select the correct format below.`,
-    });
-  }
-  if (sourceAsset?.kind === 'conventional') {
-    inputWarnings.push({
-      code: 'COMMERCIAL_SOURCE',
-      severity: 'info',
-      message: 'Conventional recording loaded.',
-      detail: 'This recording likely contains pre-existing reverberation, spatial processing and mastering. The convolved result is an experiential impression, not a strict acoustic reconstruction.',
-    });
-  }
-  if (routing.mode.includes('binaural')) {
-    inputWarnings.push({
-      code: 'BINAURAL_NOTE',
-      severity: 'info',
-      message: 'Binaural output — use headphones.',
-      detail: 'Loudspeaker playback will not reproduce the intended binaural ear signals.',
-    });
-  }
-  if (sourceAsset && irAsset && sourceAsset.sampleRate !== irAsset.sampleRate) {
-    inputWarnings.push({
-      code: 'SAMPLE_RATE_MISMATCH',
-      severity: 'warning',
-      message: `Sample rate mismatch: source ${sourceAsset.sampleRate} Hz, IR ${irAsset.sampleRate} Hz.`,
-      detail: `Files will be resampled to ${Math.min(sourceAsset.sampleRate, irAsset.sampleRate)} Hz to avoid implying additional high-frequency information. You can override this in Advanced mode.`,
-    });
-  }
+    setAnyRendering(true);
 
-  // Render
-  const handleRender = async () => {
-    if (!sourceAsset || !irAsset) return;
-    setRendering(true);
-    setRenderError(null);
-    setResult(null);
+    // Render slots in parallel
+    await Promise.all(toRender.map(async (slotId) => {
+      const ir = slots[slotId].ir!;
+      updateSlot(slotId, { rendering: true, error: null, result: null, progress: null });
 
-    const srConfig: SampleRateConfig = {
-      sourceSampleRate: sourceAsset.sampleRate,
-      irSampleRate: irAsset.sampleRate,
-      targetSampleRate: targetSR ?? Math.min(sourceAsset.sampleRate, irAsset.sampleRate),
-      strategy: targetSR ? 'custom' : 'lowest',
-    };
+      const srConfig: SampleRateConfig = {
+        sourceSampleRate: sourceAsset.sampleRate,
+        irSampleRate: ir.sampleRate,
+        targetSampleRate: targetSR ?? Math.min(sourceAsset.sampleRate, ir.sampleRate),
+        strategy: targetSR ? 'custom' : 'lowest',
+      };
 
-    const config: RenderConfiguration = {
-      routing,
-      preprocessing,
-      gain,
-      sampleRate: srConfig,
-      exportBitDepth,
-      dither,
-      maxOutputDurationSeconds: null,
-    };
+      const config: RenderConfiguration = {
+        routing,
+        preprocessing,
+        gain,
+        sampleRate: srConfig,
+        exportBitDepth,
+        dither,
+        maxOutputDurationSeconds: null,
+      };
 
-    try {
-      const r = await renderConvolution(sourceAsset, irAsset, config, setRenderProgress);
-      setResult(r);
-    } catch (e) {
-      setRenderError((e as Error).message);
-    } finally {
-      setRendering(false);
-      setRenderProgress(null);
-    }
+      try {
+        const r = await renderConvolution(
+          sourceAsset, ir, config,
+          (p) => updateSlot(slotId, { progress: p })
+        );
+        updateSlot(slotId, { result: r, rendering: false, progress: null });
+      } catch (e) {
+        updateSlot(slotId, { error: (e as Error).message, rendering: false, progress: null });
+      }
+    }));
+
+    setAnyRendering(false);
   };
 
-  // Export
-  const handleExport = () => {
+  // Export a single slot result
+  const handleExport = (slotId: SlotId) => {
+    const result = slots[slotId].result;
     if (!result?.wavBlob) return;
+    const label = slots[slotId].label.replace(/[^a-z0-9_-]/gi, '_');
     const url = URL.createObjectURL(result.wavBlob);
     const a   = document.createElement('a');
     a.href     = url;
-    a.download = result.outputAsset.filename;
+    a.download = `${result.outputAsset.filename.replace(/\.wav$/i, '')}_${label}.wav`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const canRender = !!sourceAsset && !!irAsset && availableModes.includes(routing.mode) && !rendering;
+  // Routing options based on source + first available IR
+  const firstIR = IR_SLOTS.map(id => slots[id].ir).find(Boolean) ?? null;
+  const availableModes = sourceAsset && firstIR
+    ? availableRoutingModes(sourceAsset.channelCount, firstIR.channelCount)
+    : [];
+
+  const loadedSlots   = IR_SLOTS.filter(id => slots[id].ir !== null);
+  const renderedSlots = IR_SLOTS.filter(id => slots[id].result !== null);
+  const canRender     = !!sourceAsset && loadedSlots.length > 0 && !anyRendering;
+
+  // Input warnings
+  const inputWarnings: ProcessingWarning[] = [];
+  if (sourceAsset?.kind === 'conventional') {
+    inputWarnings.push({
+      code: 'COMMERCIAL_SOURCE', severity: 'info',
+      message: 'Conventional recording loaded.',
+      detail: 'This recording may contain pre-existing reverberation and mastering. The convolved result is an experiential impression, not a strict acoustic reconstruction.',
+    });
+  }
+  if (routing.mode.includes('binaural')) {
+    inputWarnings.push({ code: 'BINAURAL_NOTE', severity: 'info', message: 'Binaural output — use headphones.', detail: 'Loudspeaker playback will not reproduce the intended binaural ear signals.' });
+  }
 
   return (
     <div className="app">
-      {/* ── Header ───────────────────────────────────────────────── */}
+
+      {/* ── Header ──────────────────────────────────────────────────────── */}
       <header className="site-header">
         <p className="site-header__eyebrow">Acoustic Convolution Tool — v0.1.0</p>
         <h1 className="site-header__title">Room Convolver</h1>
         <p className="site-header__subtitle">
-          Browser-based acoustic convolution and spatial auralisation.
-          Combine source audio with measured room impulse responses using high-quality offline processing.
+          Combine source audio with measured room impulse responses. Compare up to three room options against the dry source.
         </p>
-        <div className="site-header__privacy" role="note" aria-label="Privacy notice">
+        <div className="site-header__privacy" role="note">
           <span className="privacy-dot" aria-hidden="true" />
-          Audio files are processed locally in your browser. Nothing is uploaded to a server.
+          All processing is local. No audio leaves your browser.
         </div>
       </header>
 
-      {/* ── Mode toggle ───────────────────────────────────────────── */}
-      <div className="mode-toggle" role="group" aria-label="Interface complexity">
-        <button
-          className={`mode-toggle__btn${mode === 'basic' ? ' active' : ''}`}
-          onClick={() => setMode('basic')}
-          type="button"
-        >Basic</button>
-        <button
-          className={`mode-toggle__btn${mode === 'advanced' ? ' active' : ''}`}
-          onClick={() => setMode('advanced')}
-          type="button"
-        >Advanced</button>
+      {/* ── Mode toggle ─────────────────────────────────────────────────── */}
+      <div className="mode-toggle" role="group" aria-label="Interface mode">
+        <button className={`mode-toggle__btn${mode === 'basic' ? ' active' : ''}`} onClick={() => setMode('basic')} type="button">Basic</button>
+        <button className={`mode-toggle__btn${mode === 'advanced' ? ' active' : ''}`} onClick={() => setMode('advanced')} type="button">Advanced</button>
       </div>
 
-      {/* ── Load errors ────────────────────────────────────────────── */}
+      {/* ── Load error ──────────────────────────────────────────────────── */}
       {loadError && (
         <div className="warning-item error" style={{ marginBottom: '1rem' }}>
           <span className="warning-item__icon">✕</span>
@@ -258,11 +270,14 @@ export function App() {
         </div>
       )}
 
-      {/* ── 1. Source ─────────────────────────────────────────────── */}
+      {/* ── 01 Source ───────────────────────────────────────────────────── */}
       <section className="panel" aria-labelledby="source-heading">
         <div className="panel__header">
           <span className="panel__number">01</span>
-          <h2 className="panel__title" id="source-heading">Source material</h2>
+          <h2 className="panel__title" id="source-heading">
+            <span className="slot-badge slot-badge--a">A</span>
+            Source material — Dry
+          </h2>
           <span className={`panel__status ${sourceAsset ? 'ready' : 'pending'}`}>
             {sourceAsset ? '✓ loaded' : 'no file'}
           </span>
@@ -271,230 +286,126 @@ export function App() {
           {!sourceAsset ? (
             <>
               <p style={{ fontSize: '0.8125rem', color: 'var(--stone)', marginBottom: '0.75rem' }}>
-                Upload the audio you want to place in the measured room.
-                Dry or anechoic recordings give the most physically meaningful result.
+                Upload the audio you want to place in the measured rooms. This will always be Option A (dry) in the comparison.
               </p>
-              <div className="source-type-select" role="group" aria-label="Source type">
-                {/* In basic mode, source type is set after loading; shown here as context */}
-              </div>
-              <UploadZone
-                onFile={handleSourceFile}
-                hint="WAV · 16/24/32-bit PCM or float"
-                label="Upload source audio file"
-              />
+              <UploadZone onFile={handleSourceFile} hint="WAV · 16/24/32-bit PCM or float" label="Upload source audio" />
             </>
           ) : (
             <>
               <div className="asset-loaded">
                 <span className="asset-loaded__name">📄 {sourceAsset.filename}</span>
-                <button
-                  className="asset-loaded__clear"
-                  onClick={() => { setSourceAsset(null); setResult(null); }}
-                  type="button"
-                  aria-label="Remove source file"
-                >Remove</button>
+                <button className="asset-loaded__clear" onClick={() => { setSourceAsset(null); }} type="button">Remove</button>
               </div>
-
               <AssetMeta asset={sourceAsset} />
-
-              {sourceAsset.channels[0] && (
-                <WaveformCanvas channel={sourceAsset.channels[0]} />
-              )}
-
-              {/* Source kind selector */}
+              {sourceAsset.channels[0] && <WaveformCanvas channel={sourceAsset.channels[0]} />}
               <div style={{ marginTop: '0.875rem' }}>
-                <p style={{ fontSize: '0.75rem', color: 'var(--stone)', marginBottom: '0.4rem' }}>
-                  Source type
-                </p>
-                <div className="source-type-select" role="group" aria-label="Source kind">
+                <p style={{ fontSize: '0.75rem', color: 'var(--stone)', marginBottom: '0.4rem' }}>Source type</p>
+                <div className="source-type-select" role="group">
                   {[
-                    { kind: 'anechoic', label: 'Dry / anechoic', desc: 'Best for auralisation' },
-                    { kind: 'conventional', label: 'Conventional recording', desc: 'Already contains room acoustics' },
+                    { kind: 'anechoic',     label: 'Dry / anechoic',          desc: 'Best for auralisation' },
+                    { kind: 'conventional', label: 'Conventional recording',   desc: 'Already contains room acoustics' },
                   ].map(({ kind, label, desc }) => (
-                    <button
-                      key={kind}
-                      className={`source-type-btn${sourceAsset.kind === kind ? ' selected' : ''}`}
+                    <button key={kind} className={`source-type-btn${sourceAsset.kind === kind ? ' selected' : ''}`}
                       onClick={() => setSourceAsset({ ...sourceAsset, kind: kind as 'anechoic' | 'conventional' })}
-                      type="button"
-                      title={desc}
-                    >
-                      {label}
-                    </button>
+                      type="button" title={desc}>{label}</button>
                   ))}
                 </div>
-                {sourceAsset.kind === 'conventional' && (
-                  <p style={{ fontSize: '0.75rem', color: 'var(--stone)', marginTop: '0.4rem', maxWidth: '60ch' }}>
-                    <strong>Note:</strong> Conventional recordings contain pre-existing reverberation, stereo imaging and mastering.
-                    Convolution adds the measured room response on top. The result is an experiential impression,
-                    not a strict acoustic reconstruction.
-                  </p>
-                )}
               </div>
             </>
           )}
         </div>
       </section>
 
-      {/* ── 2. Impulse Response ──────────────────────────────────────── */}
-      <section className="panel" aria-labelledby="ir-heading">
-        <div className="panel__header">
-          <span className="panel__number">02</span>
-          <h2 className="panel__title" id="ir-heading">Room impulse response</h2>
-          <span className={`panel__status ${irAsset ? 'ready' : 'pending'}`}>
-            {irAsset ? '✓ loaded' : 'no file'}
-          </span>
+      {/* ── 02 IR Slots B / C / D ────────────────────────────────────────── */}
+      <section aria-label="Room impulse response options">
+        <div style={{ marginBottom: '0.5rem', display: 'flex', alignItems: 'baseline', gap: '0.5rem' }}>
+          <h2 style={{ fontFamily: 'var(--font-display)', fontSize: '1rem', fontWeight: 'normal' }}>Room impulse responses</h2>
+          <span style={{ fontSize: '0.75rem', color: 'var(--stone)' }}>— load one, two or three</span>
         </div>
-        <div className="panel__body">
-          {!irAsset ? (
-            <>
-              <p style={{ fontSize: '0.8125rem', color: 'var(--stone)', marginBottom: '0.75rem' }}>
-                Upload a measured impulse response. Accepted formats: mono, stereo, binaural, or Ambisonic WAV.
-                Do not use MP3 for impulse responses — lossy coding alters the transient shape, noise floor and phase.
-              </p>
-              <UploadZone
-                onFile={handleIRFile}
-                hint="WAV · mono / stereo / binaural / Ambisonic"
-                label="Upload impulse response file"
-              />
-            </>
-          ) : (
-            <>
-              <div className="asset-loaded">
-                <span className="asset-loaded__name">📄 {irAsset.filename}</span>
-                <button
-                  className="asset-loaded__clear"
-                  onClick={() => { setIrAsset(null); setResult(null); }}
-                  type="button"
-                  aria-label="Remove IR file"
-                >Remove</button>
-              </div>
 
-              <AssetMeta
-                asset={irAsset}
-                showOnset
-                onsetFrame={irAsset.estimatedOnsetFrame}
-                noiseFloorDb={irAsset.estimatedNoiseFloor}
-              />
-
-              {irAsset.channels[0] && (
-                <WaveformCanvas channel={irAsset.channels[0]} color="#5A7BB5" />
-              )}
-
-              {/* Format confirmation */}
-              {!irAsset.layout.userConfirmed && (
-                <div className="format-confirm">
-                  <p className="format-confirm__label">Confirm impulse response format</p>
-                  <p className="format-confirm__desc">
-                    {irAsset.channelCount}-channel files are ambiguous. Select the correct format to proceed.
-                    Incorrect format will produce spatial errors.
-                  </p>
-                  <div className="format-select" role="group" aria-label="Impulse response format">
-                    {LAYOUT_OPTIONS.map(({ value, label }) => (
-                      <button
-                        key={value}
-                        className={`format-btn${irAsset.layout.kind === value ? ' selected' : ''}`}
-                        onClick={() => confirmLayout(value)}
-                        type="button"
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {irAsset.layout.userConfirmed && (
-                <div style={{ marginTop: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--green)' }}>
-                    ✓ Format confirmed: {irAsset.layout.kind}
-                  </span>
-                  <button
-                    style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.75rem', color: 'var(--stone)' }}
-                    onClick={() => setIrAsset({ ...irAsset, layout: { ...irAsset.layout, userConfirmed: false } })}
-                    type="button"
-                  >change</button>
-                </div>
-              )}
-            </>
-          )}
+        <div className="ir-slots-grid">
+          {IR_SLOTS.map(slotId => (
+            <IRSlotPanel
+              key={slotId}
+              slot={slots[slotId]}
+              sourceLoaded={!!sourceAsset}
+              onFile={(file) => handleIRFile(slotId, file)}
+              onRemove={() => updateSlot(slotId, { ir: null, result: null, error: null })}
+              onLabelChange={(label) => updateSlot(slotId, { label })}
+              onConfirmLayout={(kind) => confirmLayout(slotId, kind)}
+              onExport={() => handleExport(slotId)}
+            />
+          ))}
         </div>
       </section>
 
-      {/* ── 3. Routing ────────────────────────────────────────────────── */}
-      {sourceAsset && irAsset && (
+      {/* ── 03 Routing (advanced) ───────────────────────────────────────── */}
+      {sourceAsset && loadedSlots.length > 0 && (
         <section className="panel" aria-labelledby="routing-heading">
           <div className="panel__header">
             <span className="panel__number">03</span>
             <h2 className="panel__title" id="routing-heading">Routing</h2>
+            {mode === 'basic' && (
+              <span style={{ marginLeft: 'auto', fontSize: '0.75rem', color: 'var(--stone)' }}>
+                {ROUTING_LABELS[routing.mode]?.name ?? routing.mode}
+              </span>
+            )}
           </div>
           <div className="panel__body">
-            <p style={{ fontSize: '0.8125rem', color: 'var(--stone)', marginBottom: '1rem' }}>
-              Select how source channels map to IR channels. This choice affects the physical interpretation of the result.
-            </p>
-
-            <div className="routing-grid" role="radiogroup" aria-label="Routing mode">
-              {availableModes.map(m => (
-                <div
-                  key={m}
-                  className={`routing-option${routing.mode === m ? ' selected' : ''}`}
-                  onClick={() => setRouting({ ...routing, mode: m })}
-                  role="radio"
-                  aria-checked={routing.mode === m}
-                  tabIndex={0}
-                  onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') setRouting({ ...routing, mode: m }); }}
-                >
-                  <span className="routing-option__mode">{ROUTING_LABELS[m]?.name ?? m}</span>
-                  <span className="routing-option__desc">{ROUTING_LABELS[m]?.desc ?? ''}</span>
-                </div>
-              ))}
-            </div>
-
-            {availableModes.length === 0 && (
-              <p style={{ color: 'var(--red)', fontSize: '0.8125rem' }}>
-                No valid routing modes available for this source/IR combination.
-                Check channel counts.
+            {mode === 'basic' ? (
+              <p style={{ fontSize: '0.8125rem', color: 'var(--stone)' }}>
+                {ROUTING_LABELS[routing.mode]?.desc ?? ''} Switch to Advanced mode to change routing.
               </p>
-            )}
-
-            {/* Mono sum law (advanced) */}
-            {mode === 'advanced' && routing.mode.includes('monosum') && (
-              <div style={{ marginTop: '1rem' }}>
-                <div className="control-row">
-                  <label htmlFor="monosum-law">Mono sum law</label>
-                  <select
-                    id="monosum-law"
-                    value={routing.monoSumLaw}
-                    onChange={e => setRouting({ ...routing, monoSumLaw: e.target.value as 'linear' | 'equal-power' })}
-                  >
-                    <option value="linear">Linear (L+R)/2 — preserves mono-compatible level</option>
-                    <option value="equal-power">Equal power (L+R)/√2 — preserves power of independent signals</option>
-                  </select>
+            ) : (
+              <>
+                <p style={{ fontSize: '0.8125rem', color: 'var(--stone)', marginBottom: '1rem' }}>
+                  Routing applies to all IR slots equally.
+                </p>
+                <div className="routing-grid" role="radiogroup" aria-label="Routing mode">
+                  {availableModes.map(m => (
+                    <div key={m}
+                      className={`routing-option${routing.mode === m ? ' selected' : ''}`}
+                      onClick={() => setRouting({ ...routing, mode: m })}
+                      role="radio" aria-checked={routing.mode === m} tabIndex={0}
+                      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') setRouting({ ...routing, mode: m }); }}>
+                      <span className="routing-option__mode">{ROUTING_LABELS[m]?.name ?? m}</span>
+                      <span className="routing-option__desc">{ROUTING_LABELS[m]?.desc ?? ''}</span>
+                    </div>
+                  ))}
                 </div>
-              </div>
+                {routing.mode.includes('monosum') && (
+                  <div style={{ marginTop: '1rem' }}>
+                    <div className="control-row">
+                      <label htmlFor="monosum-law">Mono sum law</label>
+                      <select id="monosum-law" value={routing.monoSumLaw}
+                        onChange={e => setRouting({ ...routing, monoSumLaw: e.target.value as 'linear' | 'equal-power' })}>
+                        <option value="linear">Linear (L+R)/2 — preserves mono-compatible level</option>
+                        <option value="equal-power">Equal power (L+R)/√2 — preserves power of independent signals</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </section>
       )}
 
-      {/* ── 4. Processing ─────────────────────────────────────────────── */}
-      {mode === 'advanced' && sourceAsset && irAsset && (
+      {/* ── 04 Processing options (advanced only) ───────────────────────── */}
+      {mode === 'advanced' && sourceAsset && loadedSlots.length > 0 && (
         <section className="panel" aria-labelledby="processing-heading">
           <div className="panel__header">
             <span className="panel__number">04</span>
             <h2 className="panel__title" id="processing-heading">Processing options</h2>
+            <span style={{ marginLeft: 'auto', fontSize: '0.75rem', color: 'var(--stone)' }}>applies to all slots</span>
           </div>
           <div className="panel__body">
-            {/* Sample rate */}
+
             <h3 style={{ fontSize: '0.875rem', fontWeight: 600, marginBottom: '0.5rem' }}>Sample rate</h3>
             <div className="control-row">
               <label htmlFor="sr-target">Target sample rate</label>
-              <select
-                id="sr-target"
-                value={targetSR ?? 0}
-                onChange={e => {
-                  const v = parseInt(e.target.value);
-                  setTargetSR(v === 0 ? null : v);
-                }}
-              >
+              <select id="sr-target" value={targetSR ?? 0}
+                onChange={e => { const v = parseInt(e.target.value); setTargetSR(v === 0 ? null : v); }}>
                 <option value={0}>Lowest (recommended)</option>
                 <option value={44100}>44.1 kHz</option>
                 <option value={48000}>48 kHz</option>
@@ -503,64 +414,40 @@ export function App() {
               </select>
             </div>
 
-            {/* IR onset */}
             <h3 style={{ fontSize: '0.875rem', fontWeight: 600, margin: '1rem 0 0.5rem' }}>IR onset</h3>
             <div className="control-row">
               <label htmlFor="onset-mode">Onset mode</label>
-              <select
-                id="onset-mode"
-                value={preprocessing.onsetMode}
-                onChange={e => setPreprocessing({ ...preprocessing, onsetMode: e.target.value as PreprocessingConfiguration['onsetMode'] })}
-              >
+              <select id="onset-mode" value={preprocessing.onsetMode}
+                onChange={e => setPreprocessing({ ...preprocessing, onsetMode: e.target.value as PreprocessingConfiguration['onsetMode'] })}>
                 <option value="preserve">Preserve absolute delay</option>
-                <option value="auto">Auto-detect onset</option>
+                <option value="auto">Auto-detect onset (recommended)</option>
                 <option value="manual">Manual onset frame</option>
               </select>
             </div>
             {preprocessing.onsetMode === 'auto' && (
               <div className="control-row">
                 <label htmlFor="predelay">Pre-delay to retain (ms)</label>
-                <input
-                  id="predelay"
-                  type="number"
-                  min={0}
-                  max={500}
-                  step={1}
-                  value={Math.round(preprocessing.preDelayFrames / (irAsset.sampleRate / 1000))}
-                  onChange={e => setPreprocessing({
-                    ...preprocessing,
-                    preDelayFrames: Math.round(parseFloat(e.target.value) * irAsset.sampleRate / 1000)
-                  })}
-                  style={{ width: '80px' }}
-                />
+                <input id="predelay" type="number" min={0} max={500} step={1}
+                  value={Math.round(preprocessing.preDelayFrames / 48)}
+                  onChange={e => setPreprocessing({ ...preprocessing, preDelayFrames: Math.round(parseFloat(e.target.value) * 48) })}
+                  style={{ width: '80px' }} />
                 <span className="control-value">ms</span>
               </div>
             )}
 
-            {/* IR preprocessing */}
             <h3 style={{ fontSize: '0.875rem', fontWeight: 600, margin: '1rem 0 0.5rem' }}>IR preprocessing</h3>
             <div className="control-row">
               <label htmlFor="remove-dc">
-                <input
-                  id="remove-dc"
-                  type="checkbox"
-                  checked={preprocessing.removeDC}
+                <input id="remove-dc" type="checkbox" checked={preprocessing.removeDC}
                   onChange={e => setPreprocessing({ ...preprocessing, removeDC: e.target.checked })}
-                  style={{ marginRight: '0.4rem' }}
-                />
+                  style={{ marginRight: '0.4rem' }} />
                 Remove DC offset
               </label>
             </div>
             <div className="control-row">
               <label htmlFor="hp-hz">High-pass filter</label>
-              <select
-                id="hp-hz"
-                value={preprocessing.highPassHz ?? 0}
-                onChange={e => {
-                  const v = parseFloat(e.target.value);
-                  setPreprocessing({ ...preprocessing, highPassHz: v === 0 ? null : v });
-                }}
-              >
+              <select id="hp-hz" value={preprocessing.highPassHz ?? 0}
+                onChange={e => { const v = parseFloat(e.target.value); setPreprocessing({ ...preprocessing, highPassHz: v === 0 ? null : v }); }}>
                 <option value={0}>Off</option>
                 <option value={20}>20 Hz (subsonic removal)</option>
                 <option value={40}>40 Hz</option>
@@ -568,16 +455,12 @@ export function App() {
               </select>
             </div>
 
-            {/* Gain */}
-            <h3 style={{ fontSize: '0.875rem', fontWeight: 600, margin: '1rem 0 0.5rem' }}>Gain and normalisation</h3>
+            <h3 style={{ fontSize: '0.875rem', fontWeight: 600, margin: '1rem 0 0.5rem' }}>Gain</h3>
             <div className="control-row">
               <label htmlFor="gain-mode">Gain mode</label>
-              <select
-                id="gain-mode"
-                value={gain.mode}
-                onChange={e => setGain({ ...gain, mode: e.target.value as GainConfiguration['mode'] })}
-              >
-                <option value="preserve">Preserve linear gain — no normalisation</option>
+              <select id="gain-mode" value={gain.mode}
+                onChange={e => setGain({ ...gain, mode: e.target.value as GainConfiguration['mode'] })}>
+                <option value="preserve">Preserve linear gain</option>
                 <option value="peak-normalise">Peak normalise</option>
                 <option value="loudness-normalise">Loudness normalise (approx.)</option>
               </select>
@@ -585,41 +468,20 @@ export function App() {
             {gain.mode === 'peak-normalise' && (
               <div className="control-row">
                 <label htmlFor="peak-target">Peak target</label>
-                <select
-                  id="peak-target"
-                  value={gain.peakTargetDbFS}
-                  onChange={e => setGain({ ...gain, peakTargetDbFS: parseFloat(e.target.value) })}
-                >
+                <select id="peak-target" value={gain.peakTargetDbFS}
+                  onChange={e => setGain({ ...gain, peakTargetDbFS: parseFloat(e.target.value) })}>
                   <option value={-1}>-1 dBFS</option>
                   <option value={-3}>-3 dBFS</option>
                   <option value={-6}>-6 dBFS</option>
                 </select>
               </div>
             )}
-            {gain.mode === 'loudness-normalise' && (
-              <div className="control-row">
-                <label htmlFor="lufs-target">LUFS target (approx.)</label>
-                <select
-                  id="lufs-target"
-                  value={gain.loudnessTargetLUFS}
-                  onChange={e => setGain({ ...gain, loudnessTargetLUFS: parseFloat(e.target.value) })}
-                >
-                  <option value={-14}>-14 LUFS (streaming)</option>
-                  <option value={-18}>-18 LUFS (broadcast)</option>
-                  <option value={-23}>-23 LUFS (EBU R128)</option>
-                </select>
-              </div>
-            )}
 
-            {/* Export */}
             <h3 style={{ fontSize: '0.875rem', fontWeight: 600, margin: '1rem 0 0.5rem' }}>Export</h3>
             <div className="control-row">
               <label htmlFor="bit-depth">Bit depth</label>
-              <select
-                id="bit-depth"
-                value={exportBitDepth}
-                onChange={e => setExportBitDepth(parseInt(e.target.value) as ExportBitDepth)}
-              >
+              <select id="bit-depth" value={exportBitDepth}
+                onChange={e => setExportBitDepth(parseInt(e.target.value) as ExportBitDepth)}>
                 <option value={16}>16-bit PCM</option>
                 <option value={24}>24-bit PCM (recommended)</option>
                 <option value={32}>32-bit float (lossless)</option>
@@ -628,13 +490,8 @@ export function App() {
             {exportBitDepth < 32 && (
               <div className="control-row">
                 <label htmlFor="dither">
-                  <input
-                    id="dither"
-                    type="checkbox"
-                    checked={dither}
-                    onChange={e => setDither(e.target.checked)}
-                    style={{ marginRight: '0.4rem' }}
-                  />
+                  <input id="dither" type="checkbox" checked={dither}
+                    onChange={e => setDither(e.target.checked)} style={{ marginRight: '0.4rem' }} />
                   Apply TPDF dither
                 </label>
               </div>
@@ -643,178 +500,268 @@ export function App() {
         </section>
       )}
 
-      {/* ── Input warnings ──────────────────────────────────────────────── */}
-      {inputWarnings.length > 0 && (
-        <WarningList warnings={inputWarnings} />
-      )}
+      {/* ── Input warnings ───────────────────────────────────────────────── */}
+      {inputWarnings.length > 0 && <WarningList warnings={inputWarnings} />}
 
-      {/* ── 5. Render ────────────────────────────────────────────────────── */}
-      {sourceAsset && irAsset && (
+      {/* ── 05 Render ────────────────────────────────────────────────────── */}
+      {sourceAsset && loadedSlots.length > 0 && (
         <section className="panel" aria-labelledby="render-heading">
           <div className="panel__header">
             <span className="panel__number">05</span>
             <h2 className="panel__title" id="render-heading">Render</h2>
-            {result && <span className="panel__status ready">✓ complete</span>}
+            {renderedSlots.length > 0 && (
+              <span className="panel__status ready">✓ {renderedSlots.length} rendered</span>
+            )}
           </div>
           <div className="panel__body">
             <p style={{ fontSize: '0.8125rem', color: 'var(--stone)', marginBottom: '1rem' }}>
-              Renders the full convolution offline.
-              The browser interface remains responsive during processing.
+              Renders all loaded IR slots using the same source and settings.
+              {loadedSlots.length > 1 && ` ${loadedSlots.length} slots will be processed.`}
             </p>
 
-            {renderProgress && (
-              <div style={{ marginBottom: '1rem' }}>
-                <p className="progress-label">{renderProgress.stage}</p>
+            {/* Per-slot progress */}
+            {IR_SLOTS.filter(id => slots[id].rendering || slots[id].progress).map(id => (
+              <div key={id} style={{ marginBottom: '0.75rem' }}>
+                <p className="progress-label">
+                  <span className="slot-badge slot-badge--sm">{id}</span>
+                  {' '}{slots[id].label} — {slots[id].progress?.stage ?? 'Starting…'}
+                </p>
                 <div className="progress-bar">
-                  <div
-                    className="progress-bar__fill"
-                    style={{ width: `${renderProgress.fraction * 100}%` }}
+                  <div className="progress-bar__fill"
+                    style={{ width: `${(slots[id].progress?.fraction ?? 0) * 100}%` }}
                     role="progressbar"
-                    aria-valuenow={Math.round(renderProgress.fraction * 100)}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                  />
+                    aria-valuenow={Math.round((slots[id].progress?.fraction ?? 0) * 100)}
+                    aria-valuemin={0} aria-valuemax={100} />
                 </div>
               </div>
-            )}
+            ))}
 
-            <button
-              className="btn btn--amber btn--large"
-              onClick={handleRender}
-              disabled={!canRender}
-              type="button"
-            >
-              {rendering ? <><span className="spinner" aria-hidden="true" /> Rendering…</> : 'Render convolution'}
+            <button className="btn btn--amber btn--large" onClick={handleRenderAll} disabled={!canRender} type="button">
+              {anyRendering
+                ? <><span className="spinner" aria-hidden="true" /> Rendering…</>
+                : `Render ${loadedSlots.length === 1 ? 'option' : `${loadedSlots.length} options`}`}
             </button>
 
-            {renderError && (
-              <div className="warning-item error" style={{ marginTop: '1rem' }}>
+            {/* Per-slot errors */}
+            {IR_SLOTS.filter(id => slots[id].error).map(id => (
+              <div key={id} className="warning-item error" style={{ marginTop: '0.75rem' }}>
                 <span className="warning-item__icon">✕</span>
                 <div>
-                  <div>Render failed</div>
-                  <div className="warning-item__detail">{renderError}</div>
+                  <div><strong>{slots[id].label}</strong> failed</div>
+                  <div className="warning-item__detail">{slots[id].error}</div>
                 </div>
               </div>
-            )}
+            ))}
           </div>
         </section>
       )}
 
-      {/* ── 6. Results ──────────────────────────────────────────────────── */}
-      {result && (
-        <>
-          {/* Render warnings */}
-          {result.warnings.length > 0 && (
-            <WarningList warnings={result.warnings} />
-          )}
-
-          {/* Preview */}
-          <section className="panel" aria-labelledby="preview-heading">
-            <div className="panel__header">
-              <span className="panel__number">06</span>
-              <h2 className="panel__title" id="preview-heading">Preview and compare</h2>
-            </div>
-            <div className="panel__body">
-              {result.outputAsset.channels[0] && (
-                <div style={{ marginBottom: '1rem' }}>
-                  <p style={{ fontSize: '0.75rem', color: 'var(--stone)', marginBottom: '0.4rem' }}>
-                    Output waveform — {result.outputAsset.channelCount} ch · {(result.outputAsset.sampleRate / 1000).toFixed(1)} kHz · {result.outputAsset.durationSeconds.toFixed(1)} s
-                    · Peak {formatDbFS(result.outputAsset.peak)}
-                  </p>
-                  <WaveformCanvas channel={result.outputAsset.channels[0]} color="#5A7BB5" />
-                </div>
-              )}
-              <AudioPreview dryAsset={sourceAsset} wetAsset={result.outputAsset} />
-            </div>
-          </section>
-
-          {/* Export */}
-          <section className="panel" aria-labelledby="export-heading">
-            <div className="panel__header">
-              <span className="panel__number">07</span>
-              <h2 className="panel__title" id="export-heading">Export</h2>
-            </div>
-            <div className="panel__body">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.75rem' }}>
-                <div>
-                  <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8125rem' }}>{result.outputAsset.filename}</p>
-                  <p style={{ fontSize: '0.75rem', color: 'var(--stone)' }}>
-                    {result.outputAsset.channelCount} ch · {(result.outputAsset.sampleRate / 1000).toFixed(1)} kHz ·
-                    {exportBitDepth}-bit {exportBitDepth === 32 ? 'float' : 'PCM'} ·
-                    {result.outputAsset.durationSeconds.toFixed(1)} s ·
-                    ~{((result.outputAsset.frameCount * result.outputAsset.channelCount * exportBitDepth / 8) / 1024 / 1024).toFixed(1)} MB
-                  </p>
-                </div>
-                <button className="btn btn--primary" onClick={handleExport} type="button">
-                  ↓ Download WAV
-                </button>
-              </div>
-            </div>
-          </section>
-
-          {/* Processing report */}
-          <section className="panel" aria-labelledby="report-heading">
-            <div className="panel__header">
-              <span className="panel__number">08</span>
-              <h2 className="panel__title" id="report-heading">Processing report</h2>
-            </div>
-            <div className="panel__body">
-              <p style={{ fontSize: '0.8125rem', color: 'var(--stone)', marginBottom: '0.75rem' }}>
-                Complete record of all processing applied. Embed or accompany output files with this report
-                for reproducibility.
-              </p>
-              <ReportDisplay report={result.report} />
-            </div>
-          </section>
-        </>
+      {/* ── 06 Compare & Preview ─────────────────────────────────────────── */}
+      {renderedSlots.length > 0 && sourceAsset && (
+        <section className="panel" aria-labelledby="compare-heading">
+          <div className="panel__header">
+            <span className="panel__number">06</span>
+            <h2 className="panel__title" id="compare-heading">Compare and preview</h2>
+          </div>
+          <div className="panel__body">
+            <MultiIRPreview
+              sourceAsset={sourceAsset}
+              slots={slots}
+              renderedSlotIds={renderedSlots}
+            />
+          </div>
+        </section>
       )}
 
-      {/* ── About ─────────────────────────────────────────────────────── */}
+      {/* ── 07 Export ────────────────────────────────────────────────────── */}
+      {renderedSlots.length > 0 && (
+        <section className="panel" aria-labelledby="export-heading">
+          <div className="panel__header">
+            <span className="panel__number">07</span>
+            <h2 className="panel__title" id="export-heading">Export</h2>
+          </div>
+          <div className="panel__body">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              {renderedSlots.map(id => {
+                const r = slots[id].result!;
+                return (
+                  <div key={id} style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', paddingBottom: '0.75rem', borderBottom: '1px solid var(--rule)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flex: 1 }}>
+                      <span className="slot-badge">{id}</span>
+                      <div>
+                        <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8125rem', fontWeight: 600 }}>{slots[id].label}</p>
+                        <p style={{ fontSize: '0.75rem', color: 'var(--stone)' }}>
+                          {r.outputAsset.channelCount} ch · {(r.outputAsset.sampleRate / 1000).toFixed(1)} kHz ·
+                          {exportBitDepth}-bit · {r.outputAsset.durationSeconds.toFixed(1)} s ·
+                          ~{((r.outputAsset.frameCount * r.outputAsset.channelCount * exportBitDepth / 8) / 1024 / 1024).toFixed(1)} MB ·
+                          Peak {formatDbFS(r.outputAsset.peak)}
+                        </p>
+                      </div>
+                    </div>
+                    <button className="btn btn--primary" onClick={() => handleExport(id)} type="button">
+                      ↓ Download WAV
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* ── 08 Processing report (advanced) ─────────────────────────────── */}
+      {mode === 'advanced' && renderedSlots.length > 0 && (
+        <section className="panel" aria-labelledby="report-heading">
+          <div className="panel__header">
+            <span className="panel__number">08</span>
+            <h2 className="panel__title" id="report-heading">Processing report</h2>
+          </div>
+          <div className="panel__body">
+            {renderedSlots.map(id => (
+              <details key={id} style={{ marginBottom: '1rem' }}>
+                <summary>
+                  <span className="slot-badge slot-badge--sm">{id}</span>
+                  {' '}{slots[id].label}
+                </summary>
+                <div style={{ marginTop: '0.75rem' }}>
+                  <ReportDisplay report={slots[id].result!.report} />
+                </div>
+              </details>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* ── About ────────────────────────────────────────────────────────── */}
       <section style={{ marginTop: '2rem' }}>
         <details>
           <summary>About methodology and limitations</summary>
-          <div style={{ fontSize: '0.8125rem', color: 'var(--stone)', lineHeight: 1.65, maxWidth: '70ch' }}>
+          <div style={{ fontSize: '0.8125rem', color: 'var(--stone)', lineHeight: 1.65, maxWidth: '70ch', marginTop: '0.75rem' }}>
             <p style={{ marginBottom: '0.75rem' }}>
               <strong style={{ color: 'var(--ink)' }}>Convolution method.</strong>{' '}
-              Partitioned overlap-add FFT convolution, processed in Float32 throughout.
-              Output length is N_source + N_IR − 1. The full reverberant tail is preserved
-              unless trimming is applied.
+              Partitioned overlap-add FFT convolution, Float32 throughout. Output length is N_source + N_IR − 1. Full reverberant tail preserved.
             </p>
             <p style={{ marginBottom: '0.75rem' }}>
               <strong style={{ color: 'var(--ink)' }}>Sample-rate conversion.</strong>{' '}
-              Lanczos-windowed sinc interpolation. Not equivalent to a dedicated
-              hardware or WASM SRC library; suitable for most use cases.
-              All channels are resampled with identical phase behaviour to preserve
-              inter-channel timing.
-            </p>
-            <p style={{ marginBottom: '0.75rem' }}>
-              <strong style={{ color: 'var(--ink)' }}>Perceived quality differences.</strong>{' '}
-              Differences between acoustic software are frequently caused by IR quality,
-              sample-rate conversion, truncation, onset alignment, normalisation and routing —
-              not by the mathematical convolution operation itself, which is deterministic.
-              This application makes all such transformations visible and configurable.
+              Lanczos-windowed sinc interpolation. All channels resampled identically to preserve inter-channel timing.
             </p>
             <p style={{ marginBottom: '0.75rem' }}>
               <strong style={{ color: 'var(--ink)' }}>Calibration.</strong>{' '}
-              No output is absolutely calibrated for SPL unless the source and IR both include
-              valid calibration metadata. Normalised audio is suitable for listening comparisons only.
+              No output is absolutely calibrated for SPL unless source and IR include valid calibration metadata. Normalised audio is suitable for listening comparisons only.
             </p>
             <p>
               <strong style={{ color: 'var(--ink)' }}>Privacy.</strong>{' '}
-              All processing is local. Files do not leave your browser.
-              No analytics are collected.
+              All processing is local. Files do not leave your browser. No analytics collected.
             </p>
           </div>
         </details>
       </section>
 
-      {/* ── Footer ───────────────────────────────────────────────────── */}
       <footer className="site-footer">
-        <span>Room Convolver v0.1.0 — Phase 1</span>
-        <span>Processing is local and private</span>
-        <a href="https://github.com" target="_blank" rel="noopener noreferrer">Source code</a>
+        <span>Room Convolver v0.1.0</span>
+        <span>All processing is local and private</span>
         <span>WAV · PCM 16/24-bit · IEEE Float 32-bit</span>
       </footer>
+    </div>
+  );
+}
+
+// ── IR Slot Panel component ──────────────────────────────────────────────────
+
+interface IRSlotPanelProps {
+  slot: IRSlot;
+  sourceLoaded: boolean;
+  onFile: (file: File) => void;
+  onRemove: () => void;
+  onLabelChange: (label: string) => void;
+  onConfirmLayout: (kind: ChannelLayoutKind) => void;
+  onExport: () => void;
+}
+
+function IRSlotPanel({ slot, sourceLoaded, onFile, onRemove, onLabelChange, onConfirmLayout }: IRSlotPanelProps) {
+  const { id, label, ir, result, rendering, error, progress } = slot;
+
+  return (
+    <div className="panel ir-slot-panel">
+      <div className="panel__header">
+        <span className="slot-badge">{id}</span>
+        <input
+          className="slot-label-input"
+          value={label}
+          onChange={e => onLabelChange(e.target.value)}
+          aria-label={`Label for option ${id}`}
+          maxLength={40}
+        />
+        {result && <span className="panel__status ready">✓ rendered</span>}
+        {rendering && <span className="panel__status pending"><span className="spinner" style={{ width: 10, height: 10 }} /></span>}
+      </div>
+      <div className="panel__body">
+        {!ir ? (
+          <UploadZone
+            onFile={onFile}
+            hint="WAV impulse response"
+            label={`Upload IR for option ${id}`}
+            disabled={!sourceLoaded}
+          />
+        ) : (
+          <>
+            <div className="asset-loaded">
+              <span className="asset-loaded__name">📄 {ir.filename}</span>
+              <button className="asset-loaded__clear" onClick={onRemove} type="button">Remove</button>
+            </div>
+
+            <AssetMeta asset={ir} showOnset onsetFrame={ir.estimatedOnsetFrame} noiseFloorDb={ir.estimatedNoiseFloor} />
+
+            {ir.channels[0] && <WaveformCanvas channel={ir.channels[0]} color="#5A7BB5" />}
+
+            {/* Format confirmation */}
+            {!ir.layout.userConfirmed && ir.channelCount >= 2 && (
+              <div className="format-confirm">
+                <p className="format-confirm__label">Confirm format</p>
+                <div className="format-select" role="group">
+                  {LAYOUT_OPTIONS.map(({ value, label: lbl }) => (
+                    <button key={value}
+                      className={`format-btn${ir.layout.kind === value ? ' selected' : ''}`}
+                      onClick={() => onConfirmLayout(value)} type="button">{lbl}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {ir.layout.userConfirmed && (
+              <p style={{ fontSize: '0.75rem', color: 'var(--green)', marginTop: '0.5rem' }}>
+                ✓ Format confirmed: {ir.layout.kind}
+              </p>
+            )}
+
+            {/* Render progress inline */}
+            {progress && (
+              <div style={{ marginTop: '0.75rem' }}>
+                <p className="progress-label">{progress.stage}</p>
+                <div className="progress-bar">
+                  <div className="progress-bar__fill" style={{ width: `${progress.fraction * 100}%` }} />
+                </div>
+              </div>
+            )}
+
+            {/* Result waveform */}
+            {result && result.outputAsset.channels[0] && (
+              <div style={{ marginTop: '0.75rem' }}>
+                <p style={{ fontSize: '0.6875rem', fontFamily: 'var(--font-mono)', color: 'var(--stone)', marginBottom: '0.25rem' }}>
+                  Output · Peak {formatDbFS(result.outputAsset.peak)} · {result.outputAsset.durationSeconds.toFixed(1)} s
+                </p>
+                <WaveformCanvas channel={result.outputAsset.channels[0]} color="#2D7A4F" height={48} />
+              </div>
+            )}
+
+            {error && (
+              <div className="warning-item error" style={{ marginTop: '0.5rem' }}>
+                <span className="warning-item__icon">✕</span>
+                <div className="warning-item__detail">{error}</div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -827,18 +774,15 @@ function autoPickRouting(
   irKind: ChannelLayoutKind,
   setRouting: (r: RoutingConfiguration) => void
 ) {
-  let mode: RoutingMode = 'mono-mono';
-
+  let routingMode: RoutingMode = 'mono-mono';
   if (sourceChannels === 1) {
-    if (irChannels === 1)  mode = 'mono-mono';
-    else if (irKind === 'binaural') mode = 'mono-binaural';
-    else if (irChannels >= 2) mode = 'mono-stereo';
-    if (irChannels === 4 || irChannels === 9 || irChannels === 16) mode = 'mono-ambisonic';
+    if (irChannels === 1) routingMode = 'mono-mono';
+    else if (irKind === 'binaural') routingMode = 'mono-binaural';
+    else if (irChannels >= 2) routingMode = 'mono-stereo';
+    if (irChannels === 4 || irChannels === 9 || irChannels === 16) routingMode = 'mono-ambisonic';
   } else {
-    if (irChannels === 1)  mode = 'stereo-monosum-stereo'; // will fail gracefully
-    else if (irKind === 'binaural') mode = 'stereo-monosum-binaural';
-    else mode = 'stereo-monosum-stereo';
+    if (irKind === 'binaural') routingMode = 'stereo-monosum-binaural';
+    else routingMode = 'stereo-monosum-stereo';
   }
-
-  setRouting({ mode, monoSumLaw: 'linear' });
+  setRouting({ mode: routingMode, monoSumLaw: 'linear' });
 }
